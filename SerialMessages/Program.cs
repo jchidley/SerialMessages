@@ -14,24 +14,33 @@ namespace SerialMessages
     public class Program
     {
         static SerialPort port;
-        static StringBuilder message;
+        private static byte[] _messageIn;
+        static int currentPositionInMessage = 0;
         static bool messageStarted = false;
-        const int maxSerialBufferSize = 1024;  // 1K max buffer for the serial port
-        static int maxMessageSize = 1024 * 10; // maximum message size is 10k: it's a small device
+        const int maxMessageSize = 1024 * 10; // maximum message size is 10k: it's a small device
+
         // This serial program relies on these serial message delimiters.
-        static byte[] startOfText = new byte[] { 0x02 }; // ASCII start of text
-        static byte[] endOfText = new byte[] { 0x03 }; // ASCII end of text
+        const byte startOfText = 2; // ASCII start of text
+        const byte endOfText = 3; // ASCII end of text
+        static UTF8Encoding encoder = new UTF8Encoding();
 
         public static void Main()
         {
-            SerialOpen();
+            // See readme.md in root directory
+            SerialOpen();  // Open the port with default settings
 
             port.DataReceived += port_DataReceived;  // do something with received data
 
+            // Tests
+            SerialSend("\n=== first started at: " + System.DateTime.Now + " ===\n\n");
+            // send data for testing purposes.
             while (true)
             {
-                SerialSend("DateTime.Now: " + System.DateTime.Now + "\n"); // send a message
-                System.Threading.Thread.Sleep(2000); // 2000 is 2 sec, release thread
+                WaitUntilNextPeriod(5000); // Send each new message on defined boundary, in milli seconds.
+                string messageOut = "DateTime.Now: " + System.DateTime.Now;
+                byte[] buff = encoder.GetBytes(messageOut);;
+                messageOut = messageOut + "\tCRC-32: " + Utility.ComputeCRC(buff,0,buff.Length,0) + "\n";  // could be too much effort...
+                SerialSend(messageOut); // send a message
             }
         }
 
@@ -39,45 +48,57 @@ namespace SerialMessages
         {
             byte currentByte;
 
-            for (int i = 0; i < maxSerialBufferSize; i++)
+            for (int i = 0; i < port.BytesToRead ; i++)
             {
                 currentByte = (byte)port.ReadByte();  // ensures that byte is always consumed
-                if (currentByte == endOfText[0])  // this byte has already been consumed
+
+                switch (currentByte)
                 {
-                    if (!messageStarted)
-                    {
-                        messageError();
+                    case startOfText: // starts new message, even if in the middle of one.
+                        newMessage(); 
+                        break; 
+                    case endOfText: // it's an error if no messageStarted or it's normal if we have a start of message.
+                        if (messageStarted)  // do something with what we've got.
+                        {
+                            var receivedMessage = new string(encoder.GetChars(_messageIn,0,_messageIn.Length));  // converts filled char[] elements to string (i.e. shortens it)
+                            useMessage(receivedMessage); // normal message completion.
+                        }  // fall through next steps
+                        messageReset(); // Reset.  This will deal with incorrectly ended messages too.
                         break;
-                    } // can't end it without starting it. 
-                    doSomethingWithMessage(); // normal message completion.  Will process any remaining bytes as a new message.
+                    default: // add characters.
+                        if (!messageStarted)
+                        {
+                            break; // ignore it.  current byte is already consumed.
+                        }
+                        // normal case
+                        _messageIn[currentPositionInMessage] = currentByte;
+                        currentPositionInMessage++;
+                        break;
                 }
 
-                if (currentByte == startOfText[0])
+                if (currentPositionInMessage >= maxMessageSize) // error.  Reset.
                 {
-                    messageStarted = true;
-                    message = new StringBuilder(maxMessageSize);  // starts new message, even if in the middle of one.
+                    messageReset(); // error.  Reset.
                 }
-
-                if (messageStarted) // Byte already consumed.  Add the char to the message, check for errors.
-                {
-                    message.Append((char)currentByte); // one more char in.
-                    if (message.Length >= maxMessageSize - 1) messageError(); // don't overrun the buffer
-                }
-
             }
         }
 
-        private static void messageError()
+        private static void messageReset()
         {
             messageStarted = false;
-            if (message != null) message.Clear();
+            currentPositionInMessage = 0;
+            _messageIn = new byte[maxMessageSize];
         }
 
-        private static void doSomethingWithMessage()
+        private static void newMessage()
         {
-            Debug.Print(message.ToString()); // preferably something more than this...
-            messageStarted = false;
-            message.Clear();
+            messageReset();  // start from a clean slate.
+            messageStarted = true;
+        }
+
+        private static void useMessage(string receivedMessage)
+        {
+            Debug.Print(receivedMessage); // preferably something more than this...
         }
 
         public static void SerialOpen(string _portname = "COM1", int _baud = 19200,
@@ -88,29 +109,27 @@ namespace SerialMessages
             port.Open();
         }
 
-        private static void SerialSend(string _message)
+        private static void SerialSend(string messageOut)
         {
-
-
-            UTF8Encoding encoder = new UTF8Encoding();
-            byte[] bytesToSend = encoder.GetBytes(_message);
-
-            if (bytesToSend.Length > maxMessageSize - 2)
+            
+           if (messageOut.Length > maxMessageSize - 1)
             {
                 new ArgumentException("Serial Message exceeded size limit of" + maxMessageSize.ToString() + "\n");
             }
-
-            if (bytesToSend.Length > maxSerialBufferSize - 2)
-            {
-                new NotImplementedException("Implement methods to handle serial data sent when size is greater than" + maxSerialBufferSize.ToString());
-                // need to do some work here
-            }
-
-            port.Write(startOfText, 0, startOfText.Length);
+            
+            port.Write((new byte[] {startOfText}), 0, 1);
+            byte[] bytesToSend = encoder.GetBytes(messageOut);
             port.Write(bytesToSend, 0, bytesToSend.Length);
-            port.Write(endOfText, 0, endOfText.Length);
-
+            port.Write((new byte[] { endOfText }), 0, 1);
         }
 
+        public static void WaitUntilNextPeriod(int period)
+        {
+            long now = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            var offset = (int)(now % period);
+            int delay = period - offset;
+            // Debug.Print("sleep for " + delay + " ms\r\n");
+            Thread.Sleep(delay);
+        }
     }
 }
