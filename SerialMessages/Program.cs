@@ -6,130 +6,175 @@ using SecretLabs.NETMF.Hardware;
 using SecretLabs.NETMF.Hardware.Netduino;
 using System.Text;
 using System.IO.Ports;
+using JCC;
 
 namespace SerialMessages
-{
-    // Tested with:
-    // * Netduino 2
-    public class Program
+{// See readme.md in root directory
+    public class Tester
     {
-        static SerialPort port;
-        private static byte[] _messageIn;
-        static int currentPositionInMessage = 0;
-        static bool messageStarted = false;
-        const int maxMessageSize = 1024 * 10; // maximum message size is 10k: it's a small device
-
-        // This serial program relies on these serial message delimiters.
-        const byte startOfText = 2; // ASCII start of text
-        const byte endOfText = 3; // ASCII end of text
-        static UTF8Encoding encoder = new UTF8Encoding();
-
+        // created new testing class
         public static void Main()
         {
-            // See readme.md in root directory
-            SerialOpen();  // Open the port with default settings
-
-            port.DataReceived += port_DataReceived;  // do something with received data
+            // Bluetooth module is 9600, EasyRadio 19200 
+            SerialMessages messengerSerial = new SerialMessages("COM1", 9600, Parity.None, 8, StopBits.One);
+            UTF8Encoding encoder = new UTF8Encoding();
 
             // Tests
-            SerialSend("\n=== first started at: " + System.DateTime.Now + " ===\n\n");
+            messengerSerial.Send("\n=== first started at: " + System.DateTime.Now + " ===\n\n");
             // send data for testing purposes.
             while (true)
             {
-                WaitUntilNextPeriod(5000); // Send each new message on defined boundary, in milli seconds.
-                string messageOut = "DateTime.Now: " + System.DateTime.Now;
-                byte[] buff = encoder.GetBytes(messageOut);;
-                messageOut = messageOut + "\tCRC-32: " + Utility.ComputeCRC(buff,0,buff.Length,0) + "\n";  // could be too much effort...
-                SerialSend(messageOut); // send a message
+                JCC.Helper.WaitUntilNextPeriod(5000); // Send each new message on defined boundary, in milli seconds.
+                string messageOut = "DateTime.Now: " + System.DateTime.Now + "\r\n";
+                messengerSerial.Send(messageOut); // send a message
+            }
+        }
+        
+    }
+    // Tested with:
+    // * Netduino 2
+
+    enum MessageStatus
+    {
+        InProgress,
+        Error,
+        End
+    }
+
+    public interface ISerialMessage
+    {
+        void Received(object sender, SerialDataReceivedEventArgs e);
+        bool Connect(byte SourceAddress, byte DestinationAddress);
+        bool Send(string message);
+        bool Send(byte SourceAddress, byte DestinationAddress, string message);
+        int MaxMessageSize { get; }
+        byte SourceAddress { get; set; }
+        byte DestinationAddress { get; set; }
+    }
+
+    public class SerialMessages : ISerialMessage
+    {
+        public byte SourceAddress { get; set; }
+        public byte DestinationAddress { get; set; }
+
+        public bool Connect(byte SourceAddress, byte DestinationAddress)
+        {
+            return true;
+        }
+        // moved tests to the static Tester class.
+        SerialPort port;
+        byte[] messageIn;
+        int currentPositionInMessage = 0;
+        bool messageStarted = false;
+        byte messageLength = 0;
+        // This serial program relies on these serial message delimiters.
+        const byte START_OF_TEXT = 2; // ASCII start of text
+        const byte END_OF_TEXT = 3; // ASCII end of text        
+        const int HEADER_SIZE = sizeof(byte) + sizeof(byte);  //START_OF_TEXT and messageLength
+        const int TAIL_SIZE = sizeof(byte); //  + sizeof(uint);  //END_OF_TEXT and CRC sizes
+        const int MAX_MESSAGE_SIZE = 250 - HEADER_SIZE - TAIL_SIZE;  // 250 bytes is EasyRadio max size
+        UTF8Encoding encoder = new UTF8Encoding();
+
+        public int MaxMessageSize {
+            get {
+                return MAX_MESSAGE_SIZE;
             }
         }
 
-        private static void port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        public SerialMessages(string portname = "COM1", int baud = 9600, Parity parity = Parity.None, int dataBits = 8, StopBits stopBits = StopBits.One)
+        {
+        // the defaults for EasyRadio advanced are set in this header
+            port = new SerialPort(portname, baud, parity, dataBits, stopBits);
+            port.Open();
+            port.DataReceived += Received;  // do something with received data
+        }
+
+        public void Received(object sender, SerialDataReceivedEventArgs e)
         {
             byte currentByte;
 
-            for (int i = 0; i < port.BytesToRead ; i++)
+            while (port.BytesToRead > 0)
             {
                 currentByte = (byte)port.ReadByte();  // ensures that byte is always consumed
 
                 switch (currentByte)
                 {
-                    case startOfText: // starts new message, even if in the middle of one.
-                        newMessage(); 
+                    case START_OF_TEXT: // starts new message, even if in the middle of one.
+                        newMessage();
+                        messageLength = (byte)port.ReadByte();
                         break; 
-                    case endOfText: // it's an error if no messageStarted or it's normal if we have a start of message.
-                        if (messageStarted)  // do something with what we've got.
+                    case END_OF_TEXT: // do something with what we've got.
+                        if (messageStarted)  // normal
                         {
-                            var receivedMessage = new string(encoder.GetChars(_messageIn,0,_messageIn.Length));  // converts filled char[] elements to string (i.e. shortens it)
+                            // will need to chop off last few bytes for CRC, if implemented.
+                            var receivedMessage = new string(encoder.GetChars(messageIn,0,messageIn.Length));  // converts filled char[] elements to string (i.e. shortens it)
                             useMessage(receivedMessage); // normal message completion.
-                        }  // fall through next steps
-                        messageReset(); // Reset.  This will deal with incorrectly ended messages too.
+                        }
+                        messageReset(); // Deal with incorrectly ended messages
                         break;
                     default: // add characters.
-                        if (!messageStarted)
+                        if (!messageStarted) // ignore it 
                         {
-                            break; // ignore it.  current byte is already consumed.
+                            break; // current byte is already consumed.
                         }
-                        // normal case
-                        _messageIn[currentPositionInMessage] = currentByte;
+                        messageIn[currentPositionInMessage] = currentByte;
                         currentPositionInMessage++;
                         break;
                 }
 
-                if (currentPositionInMessage >= maxMessageSize) // error.  Reset.
+                if (currentPositionInMessage >= MAX_MESSAGE_SIZE || messageLength > MAX_MESSAGE_SIZE) // error.  Reset.
                 {
                     messageReset(); // error.  Reset.
                 }
             }
         }
 
-        private static void messageReset()
+        private void messageReset()
         {
             messageStarted = false;
             currentPositionInMessage = 0;
-            _messageIn = new byte[maxMessageSize];
+            messageLength = 0;
+            messageIn = new byte[MAX_MESSAGE_SIZE];
         }
 
-        private static void newMessage()
+        private void newMessage()
         {
             messageReset();  // start from a clean slate.
             messageStarted = true;
         }
 
-        private static void useMessage(string receivedMessage)
+        private void useMessage(string receivedMessage)
         {
-            Debug.Print(receivedMessage); // preferably something more than this...
+            JCC.Helper.DebugPrint(receivedMessage); // preferably something more than this...
         }
 
-        public static void SerialOpen(string _portname = "COM1", int _baud = 19200,
-            Parity _parity = Parity.None, int _dataBits = 8, StopBits _stopBits = StopBits.One)
-        // the defaults for EasyRadio advanced are set in this header
+        public bool Send(byte SourceAddress, byte DestinationAddress, string message)
         {
-            port = new SerialPort(_portname, _baud, _parity, _dataBits, _stopBits);
-            port.Open();
+            return false;
         }
-
-        private static void SerialSend(string messageOut)
+        public bool Send(string messageOut)
         {
             
-           if (messageOut.Length > maxMessageSize - 1)
+           if (messageOut.Length > MAX_MESSAGE_SIZE)
             {
-                new ArgumentException("Serial Message exceeded size limit of" + maxMessageSize.ToString() + "\n");
+                new ArgumentException("Serial Message exceeded size limit of" + MAX_MESSAGE_SIZE.ToString() + "\n");
             }
-            
-            port.Write((new byte[] {startOfText}), 0, 1);
+
+            // head
+            port.Write((new byte[] {START_OF_TEXT}), 0, 1);
+            port.Write((new byte[] { (byte)messageOut.Length }), 0, 1);
+
+            // message
             byte[] bytesToSend = encoder.GetBytes(messageOut);
             port.Write(bytesToSend, 0, bytesToSend.Length);
-            port.Write((new byte[] { endOfText }), 0, 1);
+
+            //tail
+            //byte[] crc = BitConverter.GetBytes (Utility.ComputeCRC(bytesToSend, 0, bytesToSend.Length, 0));
+            //port.Write(crc, 0, crc.Length); 
+            port.Write((new byte[] { END_OF_TEXT }), 0, 1);
+
+            return true;
         }
 
-        public static void WaitUntilNextPeriod(int period)
-        {
-            long now = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
-            var offset = (int)(now % period);
-            int delay = period - offset;
-            // Debug.Print("sleep for " + delay + " ms\r\n");
-            Thread.Sleep(delay);
-        }
     }
 }
